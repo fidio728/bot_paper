@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+scan_progress.json
+scan_progress.json.tmp

@@ -300,12 +300,18 @@ def load_progress(path):
 
 
 def save_progress(path, progress):
-    """Save checkpoint atomically."""
+    """Save checkpoint directly (no tmp file — OneDrive interferes with atomic rename)."""
     progress["last_update_utc"] = datetime.now(timezone.utc).isoformat()
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    for attempt in range(5):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(progress, f, indent=1)
+            return
+        except (PermissionError, OSError):
+            time.sleep(0.5)
+    # If all retries fail, raise so we don't silently lose progress
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(progress, f, indent=1)
-    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------

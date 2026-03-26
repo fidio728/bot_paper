@@ -111,11 +111,13 @@ def get_applicable_rules(groups: list, bot_aliases: list) -> tuple:
 
     # Fall back: collect rules from all wildcard groups
     wildcard_rules = []
+    found_wildcard_group = False
     for group in groups:
         if "*" in group["agents"]:
+            found_wildcard_group = True
             wildcard_rules.extend(group["rules"])
 
-    if wildcard_rules:
+    if found_wildcard_group:
         return (wildcard_rules, False, "wildcard")
 
     return ([], False, "none")

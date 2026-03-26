@@ -259,6 +259,29 @@ Allow: /public
     assert is_path_blocked(rules, "/other") is False
 
 
+def test_13_wildcard_empty_group_still_wildcard():
+    """Wildcard group with no rules -> effective_source must be 'wildcard', not 'none'.
+    RFC 9309: empty group implicitly allows everything."""
+    content = """\
+User-agent: *
+
+User-agent: GPTBot
+Disallow: /
+"""
+    groups = parse_robots(content)
+    # SomeBot has no specific group, falls back to wildcard (which has no rules)
+    result = classify_bot(groups, "SomeBot", ["somebot"])
+    assert result["effective_source"] == "wildcard", \
+        f"Expected 'wildcard' but got '{result['effective_source']}'"
+    assert result["root_block"] == 0  # empty rules = allow all
+    assert result["specific_rule"] == 0
+
+    # GPTBot still gets its specific rules
+    gpt = classify_bot(groups, "GPTBot", ["gptbot"])
+    assert gpt["effective_source"] == "specific"
+    assert gpt["root_block"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -277,6 +300,7 @@ def run_all_tests():
         test_10_walmart_realistic,
         test_11_same_bot_multiple_specific_groups_merged,
         test_12_multiple_wildcard_groups_merged,
+        test_13_wildcard_empty_group_still_wildcard,
     ]
     passed = 0
     failed = 0
