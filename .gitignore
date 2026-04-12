@@ -1,4 +1,25 @@
+# Python
 __pycache__/
 *.pyc
+
+# Data files (synced via OneDrive, too large for git)
+*.csv
+*.dta
+*.xlsx
+
+# Progress/state files
 scan_progress.json
 scan_progress.json.tmp
+sitemap_progress.json
+
+# Binary/docs (synced via OneDrive)
+*.pdf
+*.docx
+
+# Generated outputs
+*.log
+*.png
+
+# OS
+.DS_Store
+Thumbs.db

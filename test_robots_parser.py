@@ -8,7 +8,7 @@ import os
 # Ensure the module is importable from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from robots_parser import parse_robots, get_applicable_rules, is_path_blocked, classify_bot
+from robots_parser import parse_robots, get_applicable_rules, is_path_blocked, classify_bot, extract_sitemap_urls
 
 
 def test_01_wildcard_disallow_root():
@@ -282,6 +282,97 @@ Disallow: /
     assert gpt["root_block"] == 1
 
 
+def test_14_wildcard_star():
+    """RFC 9309 * wildcard: /*.gif blocks .gif files; /private* blocks /private prefix."""
+    rules_gif = [("disallow", "/*.gif")]
+    assert is_path_blocked(rules_gif, "/image.gif") is True
+    assert is_path_blocked(rules_gif, "/dir/photo.gif") is True
+    assert is_path_blocked(rules_gif, "/image.png") is False
+    assert is_path_blocked(rules_gif, "/image.gif.txt") is True  # still contains /*.gif match
+
+    rules_priv = [("disallow", "/private*")]
+    assert is_path_blocked(rules_priv, "/private/subfolder") is True
+    assert is_path_blocked(rules_priv, "/privatecontent") is True
+    assert is_path_blocked(rules_priv, "/public") is False
+    assert is_path_blocked(rules_priv, "/") is False
+
+
+def test_15_dollar_end_anchor():
+    """RFC 9309 $ end anchor: /private/$ blocks exact /private/ but not deeper paths."""
+    rules = [("disallow", "/private/$")]
+    assert is_path_blocked(rules, "/private/") is True
+    assert is_path_blocked(rules, "/private/subfolder") is False
+    assert is_path_blocked(rules, "/private/subfolder/page") is False
+    assert is_path_blocked(rules, "/private") is False  # no trailing slash
+
+
+def test_16_star_and_dollar():
+    """Combined * and $: /*.pdf$ blocks .pdf files exactly (not .pdf.bak etc.)."""
+    rules = [("disallow", "/*.pdf$")]
+    assert is_path_blocked(rules, "/report.pdf") is True
+    assert is_path_blocked(rules, "/dir/report.pdf") is True
+    assert is_path_blocked(rules, "/report.pdf.bak") is False  # $ anchors at end
+    assert is_path_blocked(rules, "/report.txt") is False
+
+
+def test_17_extract_sitemap_urls():
+    """extract_sitemap_urls returns correct URLs; handles comments, case, non-sitemap lines."""
+    content = """\
+User-agent: *
+Disallow: /
+
+Sitemap: https://example.com/sitemap.xml
+sitemap: https://example.com/sitemap2.xml  # inline comment
+Sitemap:   https://example.com/sitemap3.xml
+Crawl-delay: 10
+"""
+    urls = extract_sitemap_urls(content)
+    assert len(urls) == 3
+    assert "https://example.com/sitemap.xml" in urls
+    assert "https://example.com/sitemap2.xml" in urls
+    assert "https://example.com/sitemap3.xml" in urls
+    # Inline comment stripped
+    assert all("inline comment" not in u for u in urls)
+    # Non-sitemap lines not included
+    assert not any("Disallow" in u or "User-agent" in u or "Crawl" in u for u in urls)
+
+
+def test_18_wildcard_blocks_root():
+    """Disallow: /* should block / (validates Step 3 re-scan rationale)."""
+    rules = [("disallow", "/*")]
+    assert is_path_blocked(rules, "/") is True
+    assert is_path_blocked(rules, "/abc") is True
+    assert is_path_blocked(rules, "/abc/def") is True
+
+    # Also via classify_bot
+    content = """\
+User-agent: GPTBot
+Disallow: /*
+"""
+    groups = parse_robots(content)
+    result = classify_bot(groups, "GPTBot", ["gptbot"])
+    assert result["root_block"] == 1, "Disallow: /* must block root /"
+
+
+def test_19_percent_encoding():
+    """Unreserved chars decoded before match; reserved chars stay encoded."""
+    # %7E is ~ (tilde), an unreserved char — should be equivalent
+    rules_tilde = [("disallow", "/%7Eprivate/")]
+    assert is_path_blocked(rules_tilde, "/~private/page") is True
+    assert is_path_blocked(rules_tilde, "/~private/") is True
+
+    # Reverse: rule uses literal ~, path uses %7E encoding
+    rules_literal = [("disallow", "/~private/")]
+    assert is_path_blocked(rules_literal, "/%7Eprivate/page") is True
+
+    # %2F is / (forward slash), a RESERVED char — must NOT be decoded
+    # Rule /public%2Fpage should NOT match /public/page
+    rules_reserved = [("disallow", "/public%2Fpage")]
+    assert is_path_blocked(rules_reserved, "/public/page") is False
+    # But it should match the literal percent-encoded path
+    assert is_path_blocked(rules_reserved, "/public%2Fpage") is True
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -301,6 +392,12 @@ def run_all_tests():
         test_11_same_bot_multiple_specific_groups_merged,
         test_12_multiple_wildcard_groups_merged,
         test_13_wildcard_empty_group_still_wildcard,
+        test_14_wildcard_star,
+        test_15_dollar_end_anchor,
+        test_16_star_and_dollar,
+        test_17_extract_sitemap_urls,
+        test_18_wildcard_blocks_root,
+        test_19_percent_encoding,
     ]
     passed = 0
     failed = 0

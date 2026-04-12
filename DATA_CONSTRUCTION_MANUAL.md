@@ -9,30 +9,34 @@
 
 ## Overview
 
-This manual documents the complete data construction pipeline from raw Compustat data to a firm-level robots.txt policy database. It maps to Steps 1-3 of the project roadmap defined in CLAUDE.md:
+This manual documents the complete data construction pipeline from raw Compustat data to a firm-level robots.txt policy database with continuous blocking intensity measures. It maps to Steps 1-4 of the project roadmap defined in CLAUDE.md:
 
 | Project Step | What was done | Output file |
 |---|---|---|
 | Step 1 | Clean weburl, extract canonical hosts | `compustat_2025_clean.csv` |
 | Step 2 | Batch-scan robots.txt for all firms | `robots_bot_panel.csv` |
 | Step 3 | Classify each firm's AI crawler policy | `robots_firm_summary.csv` |
+| Step 4 | Sitemap-based blocking intensity for partial_disallow firms | `robots_sitemap_intensity_firm.csv` |
+| Step 5 | Merge Compustat financials, build analysis-ready sample | `analysis_sample.csv` |
 
-Steps 4-5 (sitemap intensity, descriptive statistics) are not yet implemented.
+Step 6 (descriptive statistics / Table 1) is not yet implemented.
 
 ---
 
 ## Pipeline Architecture
 
-Four Python files were written from scratch. No code was inherited from earlier prototype scripts (which had known bugs, including a Walmart Allow/Disallow confusion).
+Six Python files were written from scratch. No code was inherited from earlier prototype scripts (which had known bugs, including a Walmart Allow/Disallow confusion).
 
 | File | Role | Dependencies |
 |---|---|---|
-| `robots_parser.py` | RFC 9309 parser (standalone, no I/O) | None (pure stdlib) |
-| `test_robots_parser.py` | 12 unit tests for the parser | `robots_parser.py` |
+| `robots_parser.py` | RFC 9309 parser (standalone, no I/O) | None (pure stdlib: `re`) |
+| `test_robots_parser.py` | 19 unit tests for the parser | `robots_parser.py` |
 | `clean_weburl.py` | URL cleaning and host extraction | `pandas`, `urllib.parse` |
-| `scan_robots.py` | HTTP fetching, orchestration, output | `pandas`, `requests`, `robots_parser.py` |
+| `fetch_utils.py` | Shared HTTP fetch utilities | `requests` |
+| `scan_robots.py` | Batch robots.txt scanning + classification | `pandas`, `robots_parser.py`, `fetch_utils.py` |
+| `sitemap_intensity.py` | Sitemap-based blocking intensity (Step 4) | `pandas`, `robots_parser.py`, `fetch_utils.py`, `xml.etree`, `gzip` |
 
-**Implementation order**: parser and tests first (most dangerous part), then cleaning, then scanning. The parser was written and tested independently before being plugged into the scanner, because a previous version of the project had already been bitten by parser bugs.
+**Implementation order**: parser and tests first (most dangerous part), then cleaning, then scanning. The parser was written and tested independently before being plugged into the scanner, because a previous version of the project had already been bitten by parser bugs. Fetch utilities were later extracted to `fetch_utils.py` to share HTTP logic between `scan_robots.py` and `sitemap_intensity.py`.
 
 ---
 
@@ -188,13 +192,20 @@ Critical detail: rules from ALL matching groups are merged, not just the first g
 
 **`is_path_blocked(rules, path="/") -> bool`**
 
-RFC 9309 longest-prefix-match with allow-wins-on-tie:
+RFC 9309 longest-match-wins with allow-wins-on-tie. Supports:
 
-1. For each rule, check if the rule's path is a prefix of the target path
-2. Among all matching rules, the one with the longest path wins
-3. If two rules match with the same length, `Allow` beats `Disallow`
+1. Plain prefix matching (e.g., `Disallow: /private/`)
+2. RFC 9309 wildcard `*` (matches 0+ characters, e.g., `Disallow: /*.gif`)
+3. RFC 9309 end anchor `$` (e.g., `Disallow: /private/$`)
+4. Percent-encoding normalization: unreserved ASCII chars (`A-Za-z0-9-._~`) are decoded before comparison per RFC 3986 §2.3; reserved characters stay encoded
+
+Among all matching rules, the one with the longest path wins. If two rules match with the same length, `Allow` beats `Disallow`.
 
 This is the fix for the Walmart bug: `Disallow: /` + `Allow: /` -> the two paths are the same length (1 character), so Allow wins, and the bot is NOT blocked.
+
+**`extract_sitemap_urls(content) -> list`**
+
+Extracts `Sitemap:` URL declarations from robots.txt content. Sitemap records are file-level (not group-level) per RFC 9309. Strips inline comments, case-insensitive field matching. Returns a list of URL strings in the order they appear.
 
 **`classify_bot(groups, bot_name, bot_aliases) -> dict`**
 
@@ -207,18 +218,9 @@ Combines the above functions to produce a per-bot classification:
 | `root_block` | 0 or 1 | Whether the bot is blocked at root path `/` (i.e., blocked from the entire site) |
 | `has_nonroot_disallow` | 0 or 1 | Whether any Disallow exists for a non-root path (heuristic indicator, not a full reachability proof) |
 
-### Known limitations
-
-The parser implements the core RFC 9309 semantics sufficient for this project's treatment variable (root-block and has-nonroot-disallow). It does NOT implement:
-
-- Special pattern characters `*` and `$` (e.g., `Disallow: /*.gif$`)
-- Percent-encoding normalization (e.g., `%7E` vs `~`)
-
-These would matter for fine-grained path-level analysis (Step 4: sitemap-based blocking intensity) but do not affect root-block classification.
-
 ### Unit tests (`test_robots_parser.py`)
 
-12 test cases covering all critical edge cases:
+19 test cases covering all critical edge cases:
 
 | # | Test case | What it verifies |
 |---|---|---|
@@ -234,8 +236,15 @@ These would matter for fine-grained path-level analysis (Step 4: sitemap-based b
 | 10 | Real-world Walmart-style robots.txt | Integration test with mixed specific + wildcard rules |
 | 11 | Same bot in multiple specific groups | Rules from all matching groups are merged |
 | 12 | Multiple wildcard groups | Wildcard rules from all `*` groups are merged |
+| 13 | `has_nonroot_disallow` flag | Detects nonroot Disallow paths correctly; root-only Disallow does not trigger |
+| 14 | Wildcard `*` matching | `/*.gif` blocks `/image.gif` not `/image.png`; `/private*` blocks `/private/sub` |
+| 15 | Dollar `$` end anchor | `/private/$` blocks `/private/` not `/private/subfolder` |
+| 16 | Combined `*` and `$` | `/*.pdf$` blocks `/report.pdf` not `/report.pdf.bak` |
+| 17 | `extract_sitemap_urls()` | Correct URL extraction; strips inline comments; case-insensitive; skips non-sitemap lines |
+| 18 | `Disallow: /*` blocks root | `/*` matches `/` and `/abc` (validates Step 3 re-scan rationale) |
+| 19 | Percent-encoding normalization | `/%7Eprivate/` matches `/~private/page` (unreserved decoded); `/public%2Fpage` does NOT match `/public/page` (reserved stays encoded) |
 
-All 12 tests pass.
+All 19 tests pass.
 
 ### Command to reproduce
 
@@ -419,6 +428,12 @@ One row per firm. 10,062 rows.
 - 404 responses classified as `allow` (correct per RFC 9309)
 - 403/5xx/timeout classified as `fetch_error` with all bot fields NA (never inferred)
 
+### Step 3 re-scan (after parser upgrade)
+
+After adding wildcard `*`/`$` support and percent-encoding normalization to `robots_parser.py`, Step 3 was re-run from scratch. The upgrade changes `root_block` for firms using `Disallow: /*` — the old parser evaluated `"/".startswith("/*")` = False (not blocked), while the new parser correctly matches `/*` as a regex pattern against `/` = True (blocked). `has_nonroot_disallow` is a string-presence check and is unaffected.
+
+HTTP fetch logic was also extracted to `fetch_utils.py` (see below). `scan_robots.py` now imports `fetch_robots`, `UA_RESEARCH`, `UA_BROWSER`, `MAX_CONTENT_BYTES` from `fetch_utils` instead of defining them inline. No logic or CSV schema changes.
+
 ### Command to reproduce
 
 ```bash
@@ -426,6 +441,139 @@ cd bot_paper/
 python scan_robots.py
 # Takes ~60-90 minutes for all 4,350 hosts
 # Safe to interrupt and resume (checkpointed after each host)
+```
+
+---
+
+## Shared HTTP Utilities (`fetch_utils.py`)
+
+### Goal
+
+Provide shared HTTP fetch logic used by both `scan_robots.py` (robots.txt fetching) and `sitemap_intensity.py` (robots.txt re-fetch + sitemap fetching). Avoids code duplication.
+
+### Two-layer design
+
+**`fetch_url(url, timeout=30, as_bytes=False, ua=UA_RESEARCH)`** — generic URL fetcher:
+- Retries once with browser UA if first attempt returns 403
+- Returns `{"status_code", "content", "final_url", "fetch_error"}`
+- `as_bytes=True` returns raw response bytes (used for sitemap XML/gzip)
+- No robots.txt-specific logic (no SSL fallback, no HTTP fallback)
+
+**`fetch_robots(host, timeout=15)`** — robots.txt-specific wrapper:
+- Tries HTTPS first with research UA; retries with browser UA on 403
+- SSL error only: falls back to HTTP (connection errors and timeouts do NOT trigger HTTP fallback — they are not HTTPS-specific issues)
+- Returns `{"status_code", "content", "final_url", "fetch_error", "ua_used", "http_fallback"}`
+
+**Rule**: robots.txt uses `fetch_robots()`. Sitemaps use `fetch_url(..., as_bytes=True)`. Never mix.
+
+### Constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `UA_RESEARCH` | `Mozilla/5.0 (compatible; AcademicResearchBot/1.0)` | Primary User-Agent |
+| `UA_BROWSER` | Chrome 124 browser string | Fallback for 403 responses |
+| `MAX_CONTENT_BYTES` | 1,000,000 (1 MB) | robots.txt content cap |
+
+---
+
+## Step 4: Sitemap Blocking Intensity (`sitemap_intensity.py`)
+
+### Goal (from CLAUDE.md Step 4)
+
+> For partial-block firms: fetch declared sitemaps, evaluate each URL against each bot's rules, compute a continuous blocking intensity measure.
+
+### Why this step matters
+
+The Step 3 treatment variable (`partial_disallow`) is binary and coarse — it groups together firms that block one bot from one path with firms that block seven bots from nearly everything. Sitemap intensity provides a continuous measure: what fraction of a firm's sitemap-listed URLs are blocked for each AI bot.
+
+### Important caveat: lower-bound proxy
+
+`intensity_final` is a **lower-bound proxy** based on sitemap-listed URLs. Sitemaps typically contain only search-indexable public pages — a subset of all site content. A firm could restrict AI access to non-indexed pages (APIs, internal tools, dynamic content) that never appear in sitemaps. Therefore:
+- `intensity = 0.3` means "at least 30% of sitemap-listed pages are blocked"
+- `intensity = 0` is valid for `partial_sitemap` hosts — rules exist but none match sitemap-listed paths
+- The true blocking rate may be higher than measured
+
+### Scope
+
+Only `partial_disallow` hosts are scanned for sitemaps. Other treatment categories get deterministic values:
+- `allow` → `intensity_final = 0` (no restrictions)
+- `full_disallow` → `intensity_final = 1` (everything blocked)
+- `fetch_error` → `intensity_final = NA`
+
+### Per-host processing pipeline
+
+For each unique `partial_disallow` host:
+
+1. **Re-fetch robots.txt** via `fetch_robots(host)` — re-fetched rather than cached because the 50KB content cap in `scan_progress.json` could silently truncate late `Sitemap:` lines
+   - Failure → `intensity_source = partial_refetch_error_na`
+
+2. **Parse robots.txt** via `parse_robots(content)` + `extract_sitemap_urls(content)`
+   - No sitemaps declared → `intensity_source = partial_no_sitemap_na`
+
+3. **Fetch sitemaps** via `fetch_url(url, as_bytes=True, timeout=30)`:
+   - Gzip detection: `.gz` extension or content inspection; `gzip.decompress()`
+   - XML parsing: `xml.etree.ElementTree`; namespace-aware (`{http://www.sitemaps.org/schemas/sitemap/0.9}loc` then bare `loc`)
+   - `<sitemapindex>`: recursively fetch child sitemaps (max depth 2, max 20 child sitemaps); `visited_sitemaps` set prevents circular references
+   - `<urlset>`: collect `<loc>` URL strings
+   - Partial failure: if some sitemaps fail but others succeed, continue with successful ones (`sitemap_fetch_status = partial_ok`)
+   - All failed → `intensity_source = partial_sitemap_error_na`
+
+4. **Host-scope filter**: keep only URLs where `urlparse(loc).hostname.lower().rstrip('.') == host.lower().rstrip('.')`
+   - Conservative: may discard valid canonical aliases, but prevents applying one host's robots rules to another host's URLs
+   - Tracked via `n_urls_before_host_filter`, `n_urls_after_host_filter`, `n_urls_dropped_by_host_filter`
+
+5. **Two-stage deduplication**:
+   - (a) Deduplicate on full URL string
+   - (b) Extract comparison string: `path + ('?' + query if query else '')`
+   - (c) Deduplicate on comparison string (keeps first occurrence)
+
+6. **URL cap**: `MAX_COMPARISON_URLS = 200,000` — streaming stop (not post-hoc truncation). Stops fetching additional child sitemaps once cap reached. Flags `url_cap_hit = 1` and records `n_urls_dropped_by_cap`. These hosts can be re-run individually later.
+
+7. **Evaluate blocking**: for each of 8 treatment bots, compute `n_blocked / n_total` using `get_applicable_rules()` + `is_path_blocked()` with full wildcard and percent-encoding support
+
+8. **Aggregate**: `mean_treatment_intensity` = average of 8 bot intensities (host-level)
+
+### `intensity_source` taxonomy (8 categories)
+
+| Value | Condition |
+|---|---|
+| `allow_zero` | `treatment_category == allow` |
+| `full_one` | `treatment_category == full_disallow` |
+| `partial_sitemap` | partial + ≥1 sitemap ok + `n_total > 0` |
+| `partial_no_sitemap_na` | partial + no `Sitemap:` in robots.txt |
+| `partial_sitemap_error_na` | partial + all sitemaps failed + `n_total = 0` |
+| `partial_no_urls_na` | partial + sitemaps fetched but `n_total = 0` after filter+dedup |
+| `partial_refetch_error_na` | partial + robots.txt re-fetch failed in Step 4 |
+| `fetch_error_na` | `treatment_category == fetch_error` |
+
+### Output: `robots_sitemap_intensity_host.csv`
+
+One row per `partial_disallow` host. Contains:
+- `host`, `step4_scan_utc`, `robots_refetch_status`, `sitemap_url`, `sitemap_fetch_status`
+- `n_urls_before_host_filter`, `n_urls_after_host_filter`, `n_urls_dropped_by_host_filter`, `n_sitemap_urls` (after all dedup), `url_cap_hit`, `n_urls_dropped_by_cap`, `sitemaps_truncated`
+- `{Bot}_n_blocked`, `{Bot}_intensity` for each of 8 treatment bots
+- `mean_treatment_intensity`, `max_treatment_intensity`
+
+### Output: `robots_sitemap_intensity_firm.csv`
+
+One row per firm. 10,062 rows (same anchor as `robots_firm_summary.csv`). Contains all columns from `robots_firm_summary.csv` plus:
+- Host-level intensity columns merged on `host`
+- `intensity_final`: 0 (allow) / computed mean (partial_sitemap) / 1 (full_disallow) / NA (all other)
+- `intensity_source`: 8-value label
+
+Intensity is computed at unique-host level, then mapped to all firms sharing that host (firms sharing a host get identical values).
+
+### Checkpoint and resume
+
+- `sitemap_progress.json` — tracks completed hosts; direct write with 5 retries (OneDrive-safe)
+- 0.3–0.5s delay between hosts
+
+### Command to reproduce
+
+```bash
+cd bot_paper/
+python sitemap_intensity.py --limit 20   # smoke test (first 20 hosts)
+python sitemap_intensity.py              # full run
 ```
 
 ---
@@ -440,12 +588,212 @@ After running the full pipeline, the `bot_paper/` directory contains:
 | `compustat_2025_clean.csv` | Intermediate | ~2 MB | Cleaned URLs with host extraction |
 | `robots_bot_panel.csv` | Output | ~15 MB | Bot-level panel (120,900 rows) |
 | `robots_firm_summary.csv` | Output | ~1 MB | Firm-level summary (10,062 rows) |
+| `robots_sitemap_intensity_host.csv` | Output | varies | Host-level sitemap intensity (partial_disallow hosts) |
+| `robots_sitemap_intensity_firm.csv` | Output | ~2 MB | Firm-level intensity (10,062 rows, regression-ready) |
 | `scan_progress.json` | Checkpoint | ~40 MB | Full scan results by host (for resume) |
-| `robots_parser.py` | Code | 5 KB | RFC 9309 parser module |
-| `test_robots_parser.py` | Code | 6 KB | 12 unit tests |
+| `sitemap_progress.json` | Checkpoint | varies | Sitemap scan progress (for resume) |
+| `robots_parser.py` | Code | 9 KB | RFC 9309 parser with wildcard/percent-encoding support |
+| `test_robots_parser.py` | Code | 12 KB | 19 unit tests |
 | `clean_weburl.py` | Code | 4 KB | URL cleaning script |
-| `scan_robots.py` | Code | 18 KB | Batch scanner + classifier |
+| `fetch_utils.py` | Code | 7 KB | Shared HTTP fetch utilities |
+| `scan_robots.py` | Code | 16 KB | Batch scanner + classifier |
+| `sitemap_intensity.py` | Code | ~12 KB | Sitemap blocking intensity (Step 4) |
 | `CLAUDE.md` | Documentation | 7 KB | Project spec and decisions |
+| `DATA_CONSTRUCTION_MANUAL.md` | Documentation | ~18 KB | This file |
+
+---
+
+## Cross-validation
+
+An independent reimplementation of the entire pipeline (Steps 1-4) was built from scratch by a separate AI (GPT) using only the CLAUDE.md spec and this manual. Full comparison results are in `gpt answer/`.
+
+### Firm-level comparison (N=10,062)
+
+| Metric | Value |
+|---|---|
+| Rows matched | 10,062 / 10,062 (100%) |
+| `intensity_final` identical or both NA | 9,198 (91.4%) |
+| `treatment_category` mismatch | 151 rows |
+| `intensity_source` mismatch | 287 rows |
+| Mean absolute diff (both non-NA, N=7,286) | 0.000108 |
+| Median absolute diff | 0.0 |
+| p95 absolute diff | 3.28e-07 |
+| Max absolute diff | 0.1215 (www.omadahealth.com) |
+
+### Source of differences
+
+All discrepancies trace to **live fetch timing** — robots.txt content and sitemap availability change between scans. There are zero differences attributable to algorithmic divergence:
+- `treatment_category` mismatches (151): server status changed between two scan runs (e.g., 403→200 or vice versa)
+- `intensity_source` mismatches (287): sitemap availability changed (e.g., sitemap returned 200 in one run, 403 in the other)
+- Top host-level differences (omadahealth, timken, tronox, bing, allot) all show different `n_sitemap_urls`, confirming sitemap content drift
+
+### GPT code review findings
+
+The GPT codebase was reviewed for correctness. Valid engineering issues found:
+- `fetch_utils.py`: 403 retry condition is always true (dead code on the `return first` fallback)
+- `sitemap_intensity.py`: `gzip.decompress()` has no decompressed-size limit (gzip bomb risk)
+- `sitemap_intensity.py`: `collect_locs()` function defined but never called (dead code)
+- `robots_parser.py`: specificity calculation includes `*` and `$` characters in rule length (edge case)
+
+Three RFC-related claims in the review were evaluated and rejected:
+- "Only use first matching group" — RFC 9309 is ambiguous; merging all matching groups is an intentional design choice, consistent across both implementations
+- "Cross-host redirect = no robots.txt" — RFC 9309 Section 2.3.1.2 says to follow redirects, not to discard cross-host results
+- "401/407 = disallow all" — RFC 9309 Section 2.3.1.3 treats all 4xx as "may assume allow all," not disallow
+
+---
+
+## Step 5: Build Analysis Sample (`build_analysis_sample.py`)
+
+### Goal
+
+Merge robots outcome data with Compustat financial characteristics to produce an analysis-ready dataset for descriptive statistics and regressions.
+
+### Input files
+
+| File | Role |
+|---|---|
+| `robots_sitemap_intensity_firm.csv` | Main sample: robots.txt outcome + intensity (10,062 rows) |
+| `compustat_2025_clean.csv` | Identifiers + SIC codes |
+| `2024_firm_char.csv` | Compustat Fundamentals Annual, fyear=2024 (baseline controls) |
+| `2025_firm_char.csv` | Compustat Fundamentals Annual, fyear=2025 (robustness) |
+
+### Why two years of financial data
+
+The robots.txt outcome was observed in March 2026. Using fyear=2024 financials as controls gives lagged (pre-determined) characteristics — standard practice in corporate finance to avoid look-ahead bias. fyear=2025 is included for robustness checks.
+
+### Processing steps
+
+1. **Drop exact duplicate rows** in main sample: 10,062 → 9,484 rows (578 duplicates removed; 9,484 unique gvkeys)
+
+2. **Add SIC + flags** from `compustat_2025_clean.csv`:
+   - `fund_flag = 1` if SIC ∈ {6722, 6726} (investment trusts / ETFs)
+   - `fin_flag = 1` if SIC 6000-6999 (all financial firms, for robustness exclusion)
+   - Fund/ETF: 5,719 firms (60.3%); Non-fund: 3,765 firms (39.7%)
+   - Financial (SIC 6000-6999): 6,548; Non-financial: 2,936
+
+3. **Filter firm_char** to clean lookup table:
+   - `costat == "A"` (active companies)
+   - `datafmt == "STD"` (standard format)
+   - `indfmt == "INDL"` (industrial format — avoids duplicate rows from financial-services format)
+   - After filter: 12,157 rows (2024) / 10,385 rows (2025), zero duplicate gvkeys
+
+4. **Left-join** 2024 and 2025 financials on `gvkey`, with suffixes `_2024` / `_2025`
+
+5. **Construct derived variables** (for each year):
+
+| Variable | Formula | Coverage (non-fund, 2024) |
+|---|---|---|
+| `log_at` | log(total assets) | 99.5% |
+| `roa` | ni / at | 99.4% |
+| `leverage` | (dltt + dlc) / at | 99.5% |
+| `cash_ratio` | che / at | 99.5% |
+| `rd_intensity` | xrd / at | 50.2% (normal — many firms don't report R&D) |
+| `intan_ratio` | intan / at | 98.0% |
+| `mkcap` | csho × prcc_f | 93.5% |
+| `log_mkcap` | log(market cap) | 93.5% |
+
+5b. **Training vs Search intensity aggregates**:
+   - `training_intensity` = mean of 5 training bot intensities (GPTBot, ClaudeBot, Google-Extended, CCBot, Meta-ExternalAgent)
+   - `search_intensity` = mean of 3 search bot intensities (OAI-SearchBot, Claude-SearchBot, PerplexityBot)
+
+5c. **Search-specific treatment variables** (built from `robots_bot_panel.csv`):
+
+   Treatment is defined over the **search-bot universe** (3 bots: OAI-SearchBot, Claude-SearchBot, PerplexityBot), not all 8 bots. This matches the paper's mechanism: search blocking → AI search results visibility.
+
+   | Variable | Definition |
+   |---|---|
+   | `search_treatment` | search_allow / search_partial_block / search_full_block / search_fetch_error |
+   | `search_block` | 1 if any search bot is blocked (root or nonroot) — **primary binary treatment** |
+   | `search_full_block` | 1 if all 3 search bots root-blocked |
+   | `n_search_root_blocked` | Count of search bots root-blocked (0-3) |
+   | `training_block` | 1 if any training bot root-blocked |
+   | `n_training_root_blocked` | Count of training bots root-blocked (0-5) |
+
+   Classification logic:
+   - `search_allow`: no search bot has root_block=1 or has_nonroot_disallow=1
+   - `search_partial_block`: at least one search bot blocked, but not all 3 root-blocked
+   - `search_full_block`: all 3 search bots root-blocked
+   - `search_fetch_error`: robots.txt unobservable (any search bot has root_block=NA)
+
+   Distribution (N=9,484):
+
+   | Search Treatment | N | % |
+   |---|---|---|
+   | search_allow | 4,917 | 51.8% |
+   | search_partial_block | 3,806 | 40.1% |
+   | search_full_block | 29 | 0.3% |
+   | search_fetch_error | 732 | 7.7% |
+
+   **Why search-specific treatment matters:** 128 firms that only block training bots (no search restriction) were `partial_disallow` under the old 8-bot definition but are correctly `search_allow` here. Including them in the treatment group would add noise without signal for the search channel mechanism.
+
+### Why fund/ETF coverage is low
+
+Fund/ETF firms (SIC 6722/6726) do not report standard industrial financial statements in Compustat Fundamentals Annual. Variables like `at`, `ni`, `revt` are structurally missing for these entities — not due to data quality issues but because these accounting items do not apply to investment vehicles.
+
+### Sample strategy
+
+| Analysis type | Sample | N |
+|---|---|---|
+| Full descriptive (blocking rates, treatment distribution) | All firms | 9,484 |
+| Baseline regressions with accounting controls | Non-fund (`fund_flag == 0`), retains operating financials | 3,765 |
+| Robustness: exclude all financials | `fin_flag == 0` | 2,936 |
+| Robustness: financial heterogeneity | `fin_flag × search_block` interaction | 3,765 |
+| Baseline controls | `*_2024` variables (lagged) | — |
+| Robustness controls | `*_2025` variables | — |
+
+Fund/ETF firms remain in the full sample for descriptive analysis — their robots.txt policies are meaningful (e.g., Vanguard, BlackRock websites contain investor-relevant information). They are only excluded from regressions that require industrial accounting controls. Operating financial firms (banks, insurance, REITs) are retained in the baseline because their corporate websites are economically meaningful information sources for the AI search mechanism. Excluding all SIC 6000-6999 is a robustness check, not the baseline.
+
+### R&D missing values
+
+`xrd` (R&D expense) is missing for ~50% of non-fund firms. This is standard in Compustat — firms with no material R&D do not report the item. Recommended treatment in regressions: set missing `xrd` to 0 and include an `rd_missing` dummy variable.
+
+### Output: `analysis_sample.csv`
+
+9,484 rows × 98 columns. One row per unique gvkey. Contains:
+- All columns from `robots_sitemap_intensity_firm.csv`
+- `sic`, `naics`, `exchg`, `fic`, `loc` from `compustat_2025_clean.csv`
+- `fund_flag`, `fin_flag` (sample flags)
+- `search_treatment`, `search_block`, `search_full_block`, `n_search_root_blocked` (search-specific treatment)
+- `training_block`, `n_training_root_blocked` (training-specific, for descriptives)
+- `training_intensity`, `search_intensity` (channel-specific continuous measures)
+- Raw Compustat variables with `_2024` / `_2025` suffixes
+- Derived variables (`roa_2024`, `leverage_2024`, `log_at_2024`, etc.)
+
+### Command to reproduce
+
+```bash
+cd bot_paper/
+python build_analysis_sample.py
+```
+
+---
+
+## File inventory
+
+After running the full pipeline, the `bot_paper/` directory contains:
+
+| File | Type | Size | Description |
+|---|---|---|---|
+| `compustat_2025.csv` | Input data | 1.3 MB | Raw Compustat cross-section |
+| `compustat_2025_clean.csv` | Intermediate | ~2 MB | Cleaned URLs with host extraction |
+| `2024_firm_char.csv` | Input data | ~1 MB | Compustat Fundamentals Annual (fyear=2024) |
+| `2025_firm_char.csv` | Input data | ~1 MB | Compustat Fundamentals Annual (fyear=2025) |
+| `robots_bot_panel.csv` | Output | ~15 MB | Bot-level panel (120,900 rows) |
+| `robots_firm_summary.csv` | Output | ~1 MB | Firm-level summary (10,062 rows) |
+| `robots_sitemap_intensity_host.csv` | Output | varies | Host-level sitemap intensity (partial_disallow hosts) |
+| `robots_sitemap_intensity_firm.csv` | Output | ~2 MB | Firm-level intensity (10,062 rows) |
+| `analysis_sample.csv` | Output | ~4 MB | Analysis-ready sample (9,484 rows × 98 cols, with financials + search treatment) |
+| `scan_progress.json` | Checkpoint | ~40 MB | Full scan results by host (for resume) |
+| `sitemap_progress.json` | Checkpoint | varies | Sitemap scan progress (for resume) |
+| `robots_parser.py` | Code | 9 KB | RFC 9309 parser with wildcard/percent-encoding support |
+| `test_robots_parser.py` | Code | 12 KB | 19 unit tests |
+| `clean_weburl.py` | Code | 4 KB | URL cleaning script |
+| `fetch_utils.py` | Code | 7 KB | Shared HTTP fetch utilities |
+| `scan_robots.py` | Code | 16 KB | Batch scanner + classifier |
+| `sitemap_intensity.py` | Code | ~12 KB | Sitemap blocking intensity (Step 4) |
+| `build_analysis_sample.py` | Code | 4 KB | Merge financials + build analysis sample (Step 5) |
+| `CLAUDE.md` | Documentation | 7 KB | Project spec and decisions |
+| `DATA_CONSTRUCTION_MANUAL.md` | Documentation | ~25 KB | This file |
 
 ---
 
@@ -455,6 +803,7 @@ After running the full pipeline, the `bot_paper/` directory contains:
 |---|---|---|
 | Step 1 | Done | Clean weburl |
 | Step 2 | Done | Batch scan robots.txt |
-| Step 3 | Done | Classify firms (treatment variable) |
-| Step 4 | Not started | For partial-block firms: fetch sitemaps, calculate blocking intensity (continuous treatment measure) |
-| Step 5 | Not started | Descriptive statistics: compare blocking vs non-blocking firms on observables |
+| Step 3 | Done | Classify firms (treatment variable) — re-run after parser upgrade |
+| Step 4 | Done | Sitemap blocking intensity (continuous treatment measure) |
+| Step 5 | Done | Merge Compustat financials, build analysis sample |
+| Step 6 | In progress | Descriptive statistics: Table 1 balance table by search_treatment (Stata) |

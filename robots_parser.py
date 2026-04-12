@@ -1,20 +1,127 @@
 """
 robots_parser.py — Research-grade robots.txt parser and rule evaluator.
 
-Implements the core RFC 9309 semantics used in this project:
+Implements RFC 9309 semantics:
   - User-agent group parsing with correct specificity (specific > wildcard)
   - Longest-prefix-match with allow-wins-on-tie
   - Multi-group merging for the same bot
-
-Limitations (not needed for current treatment variable, may be added later):
-  - Does NOT support RFC 9309 special pattern characters (* and $)
-  - Does NOT support percent-encoding normalization
-  These would matter for fine-grained path-level analysis (Step 4 sitemap intensity)
-  but not for root-block / has-nonroot-disallow classification.
+  - RFC 9309 special pattern characters (* and $) in paths
+  - Percent-encoding normalization (unreserved ASCII chars only)
 
 Standalone module: no HTTP, no pandas, no I/O.
 """
 
+import re
+
+
+# ---------------------------------------------------------------------------
+# Percent-encoding normalization
+# ---------------------------------------------------------------------------
+
+# Unreserved characters per RFC 3986 §2.3: ALPHA / DIGIT / "-" / "." / "_" / "~"
+# These may be safely decoded before comparison.
+# Reserved characters (/ ? # [ ] @ ! $ & ' ( ) * + , ; =) stay percent-encoded.
+_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    "0123456789-._~"
+)
+
+
+def _normalize_path(path: str) -> str:
+    """Decode percent-encoded unreserved ASCII chars; leave reserved chars encoded.
+
+    Per RFC 9309: percent-encoded unreserved ASCII octets MUST be decoded
+    before comparison. Non-ASCII and reserved characters stay encoded.
+    """
+    if "%" not in path:
+        return path
+
+    result = []
+    i = 0
+    while i < len(path):
+        if path[i] == "%" and i + 2 < len(path):
+            hex_chars = path[i + 1: i + 3]
+            if all(c in "0123456789ABCDEFabcdef" for c in hex_chars):
+                char = chr(int(hex_chars, 16))
+                if char in _UNRESERVED:
+                    result.append(char)
+                    i += 3
+                    continue
+        result.append(path[i])
+        i += 1
+    return "".join(result)
+
+
+# ---------------------------------------------------------------------------
+# Pattern matching helpers (RFC 9309 * and $)
+# ---------------------------------------------------------------------------
+
+def _has_pattern_chars(rule_path: str) -> bool:
+    """Return True if rule_path contains RFC 9309 pattern characters."""
+    return "*" in rule_path or rule_path.endswith("$")
+
+
+def _pattern_matches(rule_path: str, path: str) -> bool:
+    """Match a rule_path containing * or $ against a target path.
+
+    RFC 9309:
+    - * matches 0 or more of any character
+    - $ at end anchors to end of string; without $, match is prefix-like
+    """
+    end_anchor = rule_path.endswith("$")
+    if end_anchor:
+        rule_path = rule_path[:-1]  # strip the $
+
+    # Build regex: escape each literal segment between * wildcards
+    segments = rule_path.split("*")
+    pattern = ".*".join(re.escape(seg) for seg in segments)
+
+    if end_anchor:
+        return bool(re.fullmatch(pattern, path))
+    else:
+        # Prefix-like: path must start with the pattern; any suffix is allowed
+        return bool(re.match(pattern + ".*", path))
+
+
+# ---------------------------------------------------------------------------
+# Sitemap URL extraction
+# ---------------------------------------------------------------------------
+
+def extract_sitemap_urls(content: str) -> list:
+    """Extract Sitemap: URL declarations from robots.txt content.
+
+    Sitemap records are file-level (not group-level) per RFC 9309.
+    Returns a list of URL strings in the order they appear.
+
+    Args:
+        content: Raw robots.txt text.
+
+    Returns:
+        List of sitemap URL strings (may be empty).
+    """
+    urls = []
+    for raw_line in content.splitlines():
+        # Strip inline comments
+        comment_idx = raw_line.find("#")
+        line = raw_line[:comment_idx] if comment_idx != -1 else raw_line
+        line = line.strip()
+
+        colon_idx = line.find(":")
+        if colon_idx == -1:
+            continue
+
+        field = line[:colon_idx].strip().lower()
+        if field == "sitemap":
+            # Value is everything after the first colon (preserves URL colons)
+            value = line[colon_idx + 1:].strip()
+            if value:
+                urls.append(value)
+    return urls
+
+
+# ---------------------------------------------------------------------------
+# Group parser
+# ---------------------------------------------------------------------------
 
 def parse_robots(content: str) -> list:
     """Parse robots.txt content into a list of groups.
@@ -74,7 +181,7 @@ def parse_robots(content: str) -> list:
             has_rules = True
             current_rules.append((field, value))
 
-        # Other directives (Sitemap, Crawl-delay, etc.) are ignored
+        # Other directives (Sitemap, Crawl-delay, etc.) are ignored in group parsing
 
     # Close final group if any
     if current_agents:
@@ -82,6 +189,10 @@ def parse_robots(content: str) -> list:
 
     return groups
 
+
+# ---------------------------------------------------------------------------
+# Rule evaluation
+# ---------------------------------------------------------------------------
 
 def get_applicable_rules(groups: list, bot_aliases: list) -> tuple:
     """Get the effective rules for a bot, merging ALL matching groups.
@@ -126,9 +237,13 @@ def get_applicable_rules(groups: list, bot_aliases: list) -> tuple:
 def is_path_blocked(rules: list, path: str = "/") -> bool:
     """Determine if a path is blocked per RFC 9309 longest-match-wins.
 
-    - Prefix-match each rule's path against target path.
-    - Longest matching path wins.
-    - On tie (same length), Allow beats Disallow.
+    Supports:
+    - Plain prefix matching (e.g., Disallow: /private/)
+    - RFC 9309 wildcard * (matches 0+ chars, e.g., Disallow: /*.gif)
+    - RFC 9309 end anchor $ (e.g., Disallow: /private/$)
+    - Percent-encoding normalization (unreserved ASCII chars decoded before compare)
+
+    Longest matching path wins. On tie (same length), Allow beats Disallow.
 
     Args:
         rules: list of (directive, rule_path) tuples.
@@ -140,6 +255,8 @@ def is_path_blocked(rules: list, path: str = "/") -> bool:
     if not rules:
         return False
 
+    norm_path = _normalize_path(path)
+
     best_length = -1
     best_is_block = False
 
@@ -147,15 +264,22 @@ def is_path_blocked(rules: list, path: str = "/") -> bool:
         # Empty Disallow: means allow all
         if directive == "disallow" and rule_path == "":
             continue
-
         # Empty Allow: is meaningless, skip
         if directive == "allow" and rule_path == "":
             continue
 
-        # RFC 9309: a rule matches if rule_path is a prefix of the target path.
-        if not path.startswith(rule_path):
-            continue
+        norm_rule = _normalize_path(rule_path)
 
+        if _has_pattern_chars(norm_rule):
+            # Wildcard / end-anchor pattern matching
+            if not _pattern_matches(norm_rule, norm_path):
+                continue
+        else:
+            # Plain prefix match
+            if not norm_path.startswith(norm_rule):
+                continue
+
+        # Use raw rule_path length for specificity ranking (per RFC 9309)
         match_length = len(rule_path)
 
         if match_length > best_length:
@@ -168,6 +292,10 @@ def is_path_blocked(rules: list, path: str = "/") -> bool:
 
     return best_is_block
 
+
+# ---------------------------------------------------------------------------
+# Bot classifier
+# ---------------------------------------------------------------------------
 
 def classify_bot(groups: list, bot_name: str, bot_aliases: list) -> dict:
     """Classify a single bot's access based on parsed robots.txt groups.
@@ -188,7 +316,8 @@ def classify_bot(groups: list, bot_name: str, bot_aliases: list) -> dict:
 
     root_block = 1 if is_path_blocked(rules, "/") else 0
 
-    # has_nonroot_disallow: heuristic — any Disallow with non-empty, non-root path
+    # has_nonroot_disallow: heuristic — any Disallow with non-empty, non-root path.
+    # This is a string-presence check, not affected by wildcard support.
     has_nonroot_disallow = 0
     for directive, rule_path in rules:
         if directive == "disallow" and rule_path not in ("", "/"):

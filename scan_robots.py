@@ -22,11 +22,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
-
-# Add current directory to path for robots_parser import
+# Add current directory to path for local module imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from robots_parser import classify_bot, parse_robots
+from fetch_utils import fetch_robots, UA_RESEARCH, UA_BROWSER, MAX_CONTENT_BYTES
 
 # ---------------------------------------------------------------------------
 # Bot taxonomy
@@ -60,17 +59,6 @@ TREATMENT_BOTS = TRAINING_BOTS + SEARCH_BOTS
 AI_BOTS = [b for b, v in BOT_TAXONOMY.items() if v["group"] != "control"]
 
 # ---------------------------------------------------------------------------
-# HTTP config
-# ---------------------------------------------------------------------------
-
-UA_RESEARCH = "Mozilla/5.0 (compatible; AcademicResearchBot/1.0)"
-UA_BROWSER = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-MAX_CONTENT_BYTES = 1_000_000  # 1 MB cap on robots.txt
-
-# ---------------------------------------------------------------------------
 # Status type helpers
 # ---------------------------------------------------------------------------
 
@@ -95,142 +83,6 @@ def classify_status_type(status_code, fetch_error):
     if 500 <= status_code < 600:
         return "http_error_5xx"
     return "http_error_other"
-
-
-# ---------------------------------------------------------------------------
-# Fetch
-# ---------------------------------------------------------------------------
-
-def fetch_robots(host, timeout=15):
-    """Fetch robots.txt from a host.
-
-    Returns dict: status_code, content, final_url, fetch_error, ua_used.
-    """
-    https_url = f"https://{host}/robots.txt"
-    http_url = f"http://{host}/robots.txt"
-    https_failed_reason = None  # track why HTTPS failed, for auditing
-
-    # --- HTTPS attempt ---
-    for ua, ua_label in [(UA_RESEARCH, "research"), (UA_BROWSER, "browser")]:
-        try:
-            resp = requests.get(
-                https_url,
-                headers={"User-Agent": ua},
-                timeout=timeout,
-                allow_redirects=True,
-            )
-            if resp.status_code == 403 and ua_label == "research":
-                continue  # retry with browser UA
-
-            content = resp.text[:MAX_CONTENT_BYTES] if resp.status_code == 200 else ""
-            return {
-                "status_code": resp.status_code,
-                "content": content,
-                "final_url": resp.url,
-                "fetch_error": "",
-                "ua_used": ua_label,
-                "http_fallback": False,
-            }
-        except requests.exceptions.SSLError:
-            # Only SSL errors trigger HTTP fallback
-            https_failed_reason = "ssl_error"
-            break
-        except requests.exceptions.Timeout:
-            if ua_label == "research":
-                continue
-            # Timeout is NOT an SSL issue — do not fallback to HTTP
-            return {
-                "status_code": None,
-                "content": "",
-                "final_url": https_url,
-                "fetch_error": "timeout",
-                "ua_used": ua_label,
-                "http_fallback": False,
-            }
-        except requests.exceptions.TooManyRedirects:
-            return {
-                "status_code": None,
-                "content": "",
-                "final_url": https_url,
-                "fetch_error": "too_many_redirects",
-                "ua_used": ua_label,
-                "http_fallback": False,
-            }
-        except requests.exceptions.ConnectionError:
-            # ConnectionError is ambiguous — do NOT fallback to HTTP
-            # (could be DNS failure, firewall, temporary network issue)
-            if ua_label == "research":
-                continue
-            return {
-                "status_code": None,
-                "content": "",
-                "final_url": https_url,
-                "fetch_error": "connection_error",
-                "ua_used": ua_label,
-                "http_fallback": False,
-            }
-        except requests.exceptions.RequestException as e:
-            return {
-                "status_code": None,
-                "content": "",
-                "final_url": https_url,
-                "fetch_error": str(type(e).__name__),
-                "ua_used": ua_label,
-                "http_fallback": False,
-            }
-
-    # --- HTTP fallback (only after SSLError) ---
-    if https_failed_reason == "ssl_error":
-        for ua, ua_label in [(UA_RESEARCH, "research"), (UA_BROWSER, "browser")]:
-            try:
-                resp = requests.get(
-                    http_url,
-                    headers={"User-Agent": ua},
-                    timeout=timeout,
-                    allow_redirects=True,
-                )
-                if resp.status_code == 403 and ua_label == "research":
-                    continue
-                content = resp.text[:MAX_CONTENT_BYTES] if resp.status_code == 200 else ""
-                return {
-                    "status_code": resp.status_code,
-                    "content": content,
-                    "final_url": resp.url,
-                    "fetch_error": "",
-                    "ua_used": ua_label,
-                    "http_fallback": True,
-                }
-            except requests.exceptions.Timeout:
-                if ua_label == "research":
-                    continue
-                return {
-                    "status_code": None,
-                    "content": "",
-                    "final_url": http_url,
-                    "fetch_error": "timeout_after_ssl_fallback",
-                    "ua_used": ua_label,
-                    "http_fallback": True,
-                }
-            except requests.exceptions.RequestException as e:
-                if ua_label == "research":
-                    continue
-                return {
-                    "status_code": None,
-                    "content": "",
-                    "final_url": http_url,
-                    "fetch_error": f"{type(e).__name__}_after_ssl_fallback",
-                    "ua_used": ua_label,
-                    "http_fallback": True,
-                }
-
-    return {
-        "status_code": None,
-        "content": "",
-        "final_url": https_url,
-        "fetch_error": https_failed_reason or "all_attempts_failed",
-        "ua_used": "",
-        "http_fallback": https_failed_reason == "ssl_error",
-    }
 
 
 # ---------------------------------------------------------------------------
